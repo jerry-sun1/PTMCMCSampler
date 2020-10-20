@@ -8,6 +8,8 @@ import scipy.stats as ss
 import os
 import sys
 import time
+import multiprocessing as mp
+import random
 from .nutsjump import NUTSJump, HMCJump, MALAJump
 
 try:
@@ -60,7 +62,7 @@ class PTSampler(object):
 
     def __init__(self, ndim, logl, logp, cov, groups=None, loglargs=[], loglkwargs={},
                  logpargs=[], logpkwargs={}, logl_grad=None, logp_grad=None,
-                 comm=MPI.COMM_WORLD, outDir='./chains', verbose=True, resume=False):
+                 comm=MPI.COMM_WORLD, outDir='./chains', filename = 'chain.txt', verbose=True, resume=False, disk_pt=False, disk_pt_temp = 1):
 
         # MPI initialization
         self.comm = comm
@@ -80,6 +82,10 @@ class PTSampler(object):
         self.outDir = outDir
         self.verbose = verbose
         self.resume = resume
+
+        self.disk_pt = disk_pt
+        self.disk_pt_temp = disk_pt_temp
+        self.disk_pt_fname = filename
 
         # setup output file
         if not os.path.exists(self.outDir):
@@ -131,6 +137,7 @@ class PTSampler(object):
         @Tmin: minumum temperature to use in temperature ladder
 
         """
+
         # get maximum number of iteration
         if maxIter is None and self.MPIrank > 0:
             maxIter = 2 * Niter
@@ -149,6 +156,7 @@ class PTSampler(object):
         self.Niter = Niter
         self.neff = neff
         self.tstart = 0
+
 
         N = int(maxIter / thin)
 
@@ -209,11 +217,16 @@ class PTSampler(object):
 
         # temperature for current chain
         self.temp = self.ladder[self.MPIrank]
+        if self.disk_pt:
+            self.temp = self.disk_pt_temp
 
         # hot chain sampling from prior
         if hotChain and self.MPIrank == self.nchain-1:
             self.temp = 1e80
             self.fname = self.outDir + '/chain_hot.txt'
+        elif self.disk_pt:
+            print("Setting chain name to: {}".format(self.disk_pt_fname))
+            self.fname = self.outDir + self.disk_pt_fname
         else:
             self.fname = self.outDir + '/chain_{0}.txt'.format(self.temp)
 
@@ -503,14 +516,19 @@ class PTSampler(object):
                 self.jumpDict[jump_name][1] += 1
 
         # temperature swap
-        swapReturn, p0, lnlike0, lnprob0 = self.PTswap(
-            p0, lnlike0, lnprob0, iter)
+        if self.disk_pt:
+            #print("Proposing swap")
+            p0, lnlike0, lnprob0 = self.disk_PTSwap(
+                p0, lnlike0, lnprob0, iter)
+        else:
+            swapReturn, p0, lnlike0, lnprob0 = self.PTswap(
+                p0, lnlike0, lnprob0, iter)
 
-        # check return value
-        if swapReturn != 0:
-            self.swapProposed += 1
-            if swapReturn == 2:
-                self.nswap_accepted += 1
+            # check return value
+            if swapReturn != 0:
+                self.swapProposed += 1
+                if swapReturn == 2:
+                    self.nswap_accepted += 1
 
         self.updateChains(p0, lnlike0, lnprob0, iter)
 
@@ -620,12 +638,78 @@ class PTSampler(object):
 
         return swapReturn, p0, lnlike0, lnprob0
 
+    def disk_PTSwap(self, p0, lnlike0, lnprob0, iter):
+        """
+        Method to attempt a PT swap with a chain that exists on the disk.
+        This is less of a "swap", since we will just be taking the configuration
+        of the other chain and attempting to "import" it into the current run.
+        We use the disk in order to avoid having to install mpi, which is
+        generally difficult on computing clusters
+        """
+
+        #pick an adjacent chain to grab
+        all_files = os.listdir(self.outDir)
+        chains_to_swap = []
+        for filename in all_files:
+            if "chain_" in filename and filename != self.disk_pt_fname:
+                chains_to_swap.append(filename)
+        #Get the other config
+        #print(chains_to_swap)
+        fname_to_swap = random.choice(chains_to_swap)
+        if os.stat(self.outDir + fname_to_swap).st_size != 0:
+            other_temp, other_lnprob0, other_lnlike0, other_chain_accept, other_pt_accept, other_p0 = self._get_config(self.outDir + fname_to_swap)
+            print("other_temp: {}, type: {}".format(other_temp, type(other_temp)))
+            print("other_lnlike0: {}, type: {}".format(other_lnlike0, type(other_lnlike0)))
+
+            print("self.temp: {}, type: {}".format(self.temp, type(self.temp)))
+            print(lnlike0)
+            #Calculate the lnswap likelihood
+            lnswap_accept =  1/self.temp * other_lnlike0 + 1/other_temp * lnlike0 - 1/self.temp * lnlike0 - 1/other_temp * other_lnlike0
+            accept_ratio = min([1, np.exp(lnswap_accept)])
+            #Accept/reject
+            if random.random() < accept_ratio:
+                print("Swap accepted with {}".format(fname_to_swap))
+                return other_p0, other_lnlike0, other_lnprob0
+        else:
+            return p0, lnlike0, lnprob0
+
+
+
+    def _get_config(self, fname):
+        """
+        Method to get the configuration from another chain.
+        Should just pick out the last line.
+        """
+
+
+        with open(fname, 'rb') as f:
+            f.seek(-2, os.SEEK_END)
+            while f.read(1) != b'\n':
+                f.seek(-2, os.SEEK_CUR)
+            last_line = f.readline().decode()
+
+        print("Config before splitting: {}".format(last_line))
+        config = last_line.split("\t") #split by tab characters to get the actual config as a list
+        print("Config after splitting: {}" .format(config))
+        temp = float(config[-5])
+        lnprob0= float(config[-4])
+        lnlike0 = float(config[-3])
+        chain_accept = float(config[-2])
+        pt_accept = float(config[-1])
+
+        p0 = config[:-5]
+        for el in p0:
+            el = float(el)
+
+        return temp, lnprob0, lnlike0, chain_accept, pt_accept, p0
+
+
+
     def temperatureLadder(self, Tmin, Tmax=None, tstep=None):
         """
         Method to compute temperature ladder. At the moment this uses
         a geometrically spaced temperature ladder with a temperature
         spacing designed to give 25 % temperature swap acceptance rate.
-
         """
 
         # TODO: make options to do other temperature ladders
@@ -645,14 +729,16 @@ class PTSampler(object):
 
     def _writeToFile(self, iter):
         """
-        Function to write chain file. File has 3+ndim columns,
-        the first is log-posterior (unweighted), log-likelihood,
-        and acceptance probability, followed by parameter values.
+        Function to write chain file. File has ndim+5 columns,
+        the first is parameter values, followed by
+        temperature, log-posterior (unweighted), log-likelihood,
+        and acceptance probability and pt_accept probability.
 
         @param iter: Iteration of sampler
 
         """
 
+        print("About to save to {}".format(self.fname))
         self._chainfile = open(self.fname, 'a+')
         for jj in range((iter - self.isave), iter, self.thin):
             ind = int(jj / self.thin)
@@ -662,7 +748,7 @@ class PTSampler(object):
 
             self._chainfile.write('\t'.join(['%22.22f' % (self._chain[ind, kk])
                                              for kk in range(self.ndim)]))
-            self._chainfile.write('\t%f\t%f\t%f\t%f\n' % (self._lnprob[ind],
+            self._chainfile.write('\t%f\t%f\t%f\t%f\t%f\n' % (self.temp, self._lnprob[ind],
                                                           self._lnlike[ind],
                                                           self.naccepted/iter,
                                                           pt_acc))
@@ -779,7 +865,7 @@ class PTSampler(object):
         # small jump
         elif prob > 0.9:
             scale = 0.2
-        
+
         # small-medium jump
         # elif prob > 0.6:
             #:wq    scale = 0.5
@@ -837,7 +923,7 @@ class PTSampler(object):
         # large jump
         if prob > 0.97:
             scale = 10
-        
+
         # small jump
         elif prob > 0.9:
             scale = 0.2
@@ -983,6 +1069,8 @@ class PTSampler(object):
 
         # randomize proposal cycle
         self.randomizedPropCycle = [self.propCycle[ind] for ind in index]
+
+
 
     # call proposal functions from cycle
     def _jump(self, x, iter):
