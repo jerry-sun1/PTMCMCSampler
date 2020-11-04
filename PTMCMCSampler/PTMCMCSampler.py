@@ -738,7 +738,7 @@ class PTSampler(object):
 
         """
 
-        print("About to save to {}".format(self.fname))
+        #print("About to save to {}".format(self.fname))
         self._chainfile = open(self.fname, 'a+')
         for jj in range((iter - self.isave), iter, self.thin):
             ind = int(jj / self.thin)
