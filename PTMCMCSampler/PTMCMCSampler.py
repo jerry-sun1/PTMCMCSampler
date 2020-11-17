@@ -62,12 +62,16 @@ class PTSampler(object):
 
     def __init__(self, ndim, logl, logp, cov, groups=None, loglargs=[], loglkwargs={},
                  logpargs=[], logpkwargs={}, logl_grad=None, logp_grad=None,
-                 comm=MPI.COMM_WORLD, outDir='./chains', filename = 'chain.txt', verbose=True, resume=False, disk_pt=False, disk_pt_temp = 1):
+                 comm=MPI.COMM_WORLD, outDir='./chains', filename = "chain.txt", verbose=True, resume=False, disk_pt=False, disk_pt_temp = 1,
+                 simulated_anneal=False, temp_sched=None):
 
         # MPI initialization
         self.comm = comm
         self.MPIrank = self.comm.Get_rank()
         self.nchain = self.comm.Get_size()
+
+        self.sim_ann = simulated_anneal
+        self.temp_sched = temp_sched
 
         self.ndim = ndim
         self.logl = _function_wrapper(logl, loglargs, loglkwargs)
@@ -86,7 +90,6 @@ class PTSampler(object):
         self.disk_pt = disk_pt
         self.disk_pt_temp = disk_pt_temp
         self.disk_pt_fname = filename
-
         # setup output file
         if not os.path.exists(self.outDir):
             try:
@@ -230,6 +233,7 @@ class PTSampler(object):
         else:
             self.fname = self.outDir + '/chain_{0}.txt'.format(self.temp)
 
+        print('self.fname is: {}'.format(self.fname))
         # write hot chains
         self.writeHotChains = writeHotChains
 
@@ -420,6 +424,7 @@ class PTSampler(object):
         @return lnprob0: next value of posterior after one MCMC step
 
         """
+        #print("Doing a step in chain: {}".format(self.fname))
         # update covariance matrix
         if (iter - 1) % self.covUpdate == 0 and (iter -
                                                  1) != 0 and self.MPIrank == 0:
@@ -498,8 +503,12 @@ class PTSampler(object):
 
                 newlnprob = -np.inf
 
-            else:
 
+
+            else:
+                if self.sim_ann: #if we're annealing, we need to decrease the temperature acc to the temperature schedule
+                    self.temp = self.temp_sched[iter]
+                    
                 newlnlike = self.logl(y)
                 newlnprob = 1 / self.temp * newlnlike + lp
 
@@ -518,8 +527,20 @@ class PTSampler(object):
         # temperature swap
         if self.disk_pt:
             #print("Proposing swap")
-            p0, lnlike0, lnprob0 = self.disk_PTSwap(
-                p0, lnlike0, lnprob0, iter)
+            #print("Normally, i would attempt a swap here, but am bugfixing.")
+            swapped = self.disk_PTSwap(p0, lnlike0, lnprob0, iter)
+
+            ##Getting a bug in which the swap is sometimes giving back NoneType. I assume that this is because of some file-appending shenanigans
+            if swapped is None: ### TODO: Figure out why sometimes swapping gets None typed... for now, we just avoid this by rejecting the swap and logging it
+                print("swap rejected due to the proposed swap coming back as NoneType")
+                self.updateChains(p0, lnlike0, lnprob0, iter)
+                return p0, lnlike0, lnprob0
+
+            other_p0, other_lnlike0, other_lnprob0 = swapped
+
+            assert type(other_p0) == type(p0), "types of p0 don't match. The types are {} and {}, respectively".format(type(p0), type(other_p0))
+            assert type(other_lnlike0) == type(lnlike0), "types of lnlike0 don't match. The types are {} and {}, respectively".format(type(lnlike0), type(other_lnlike0))
+            assert type(other_lnprob0) == type(lnprob0), "types of lnprob0 don't match. The types are {} and {}, respectively".format(type(lnprob0), type(other_lnprob0))
         else:
             swapReturn, p0, lnlike0, lnprob0 = self.PTswap(
                 p0, lnlike0, lnprob0, iter)
@@ -655,23 +676,35 @@ class PTSampler(object):
                 chains_to_swap.append(filename)
         #Get the other config
         #print(chains_to_swap)
-        fname_to_swap = random.choice(chains_to_swap)
-        if os.stat(self.outDir + fname_to_swap).st_size != 0:
-            other_temp, other_lnprob0, other_lnlike0, other_chain_accept, other_pt_accept, other_p0 = self._get_config(self.outDir + fname_to_swap)
-            print("other_temp: {}, type: {}".format(other_temp, type(other_temp)))
-            print("other_lnlike0: {}, type: {}".format(other_lnlike0, type(other_lnlike0)))
-
-            print("self.temp: {}, type: {}".format(self.temp, type(self.temp)))
-            print(lnlike0)
-            #Calculate the lnswap likelihood
-            lnswap_accept =  1/self.temp * other_lnlike0 + 1/other_temp * lnlike0 - 1/self.temp * lnlike0 - 1/other_temp * other_lnlike0
-            accept_ratio = min([1, np.exp(lnswap_accept)])
-            #Accept/reject
-            if random.random() < accept_ratio:
-                print("Swap accepted with {}".format(fname_to_swap))
-                return other_p0, other_lnlike0, other_lnprob0
-        else:
+        if len(chains_to_swap) == 0:
+            print("Swap rejected. Could not find a different chain in the folder.")
             return p0, lnlike0, lnprob0
+
+        else:
+            fname_to_swap = random.choice(chains_to_swap)
+            if os.path.getsize(self.outDir + fname_to_swap) > 0:
+                #print("size of {} is {}".format(fname_to_swap, os.path.getsize(self.outDir + fname_to_swap)))
+                other_temp, other_lnprob0, other_lnlike0, other_chain_accept, other_pt_accept, other_p0 = self._get_config(self.outDir + fname_to_swap)
+                #print("other_temp: {}, type: {}".format(other_temp, type(other_temp)))
+                #print("other_lnlike0: {}, type: {}".format(other_lnlike0, type(other_lnlike0)))
+
+                #print("self.temp: {}, type: {}".format(self.temp, type(self.temp)))
+                #print("self.lnlike: {}, type: {}".format(lnlike0, type(lnlike0)))
+                #Calculate the lnswap likelihood
+                lnswap_accept =  1/self.temp * other_lnlike0 + 1/other_temp * lnlike0 - 1/self.temp * lnlike0 - 1/other_temp * other_lnlike0
+                #print("The lnlikelihood to swap is: {}".format(lnswap_accept))
+                accept_ratio = min([0, lnswap_accept])
+                if accept_ratio == 0:
+                    accept_ratio = 1
+                else:
+                #Accept/reject
+                #print("The acceptance ratio is {}".format(accept_ratio))
+                    if np.log(random.random()) < accept_ratio:
+                        #print("Swap accepted with {}".format(fname_to_swap))
+                        return other_p0, other_lnlike0, other_lnprob0
+            else:
+                #print("swap rejected with {}".format(fname_to_swap))
+                return p0, lnlike0, lnprob0
 
 
 
@@ -683,14 +716,18 @@ class PTSampler(object):
 
 
         with open(fname, 'rb') as f:
-            f.seek(-2, os.SEEK_END)
-            while f.read(1) != b'\n':
-                f.seek(-2, os.SEEK_CUR)
+            f.seek(-2, 2)
+            while f.read(1) != b'\n' and f.tell() > 1:
+                #print("position cursor at: {}".format(f.tell()))
+                f.seek(-2, 1)
+                if f.tell() == 0:
+                    break
+
             last_line = f.readline().decode()
 
-        print("Config before splitting: {}".format(last_line))
+        #print("Config before splitting: {}".format(last_line))
         config = last_line.split("\t") #split by tab characters to get the actual config as a list
-        print("Config after splitting: {}" .format(config))
+        #print("Config after splitting: {}" .format(config))
         temp = float(config[-5])
         lnprob0= float(config[-4])
         lnlike0 = float(config[-3])
@@ -701,7 +738,7 @@ class PTSampler(object):
         for el in p0:
             el = float(el)
 
-        return temp, lnprob0, lnlike0, chain_accept, pt_accept, p0
+        return temp, np.float64(lnprob0), np.float64(lnlike0), chain_accept, pt_accept, np.array(p0)
 
 
 
@@ -738,7 +775,7 @@ class PTSampler(object):
 
         """
 
-        print("About to save to {}".format(self.fname))
+        #print("About to save to {}".format(self.fname))
         self._chainfile = open(self.fname, 'a+')
         for jj in range((iter - self.isave), iter, self.thin):
             ind = int(jj / self.thin)
